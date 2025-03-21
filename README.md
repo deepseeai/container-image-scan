@@ -13,7 +13,9 @@ All output is sent to stdout/stderr.
 
 ## Prerequisites
 
-This sample/demo script requires the [Docker Engine API python library](https://pypi.org/project/docker/) or the [Bindings for Podman RESTful API](https://pypi.org/project/podman/) and the [FalconPy SDK](https://github.com/CrowdStrike/falconpy). These can be installed via `pip`:
+- Docker or Podman installed and running
+- Python3 and pip installed
+- CrowdStrike OAuth2 API keys with appropriate permissions (see below)
 
 ### OAuth2 API Key Prerequisites
 
@@ -23,28 +25,52 @@ A CrowdStrike [OAuth2 API keys](https://falcon.crowdstrike.com/support/api-clien
 | ---------------------- | ------------------ |
 | Falcon Container Image | `read` and `write` |
 
-### Docker Python Prerequisites
+## Installation
+
+Choose ONE of the following installation methods based on your container runtime:
+
+### Option 1: Docker Installation
+
+If you're using Docker:
 
 ```shell
-$ pip3 install docker crowdstrike-falconpy
+pip3 install docker crowdstrike-falconpy retry
 ```
 
-### Podman Python Prerequisites
+### Option 2: Podman Installation
+
+If you're using Podman:
 
 ```shell
-$ pip3 install podman crowdstrike-falconpy
+pip3 install podman crowdstrike-falconpy retry
 ```
 
-Once the Podman python dependencies are installed, configure the URI path for the service.
+#### Important Podman Configuration Notes
+
+1. For ***rootless*** Podman, ensure the podman socket is running:
+
+   ```shell
+   systemctl --user start podman.socket
+   ```
+
+2. For ***rootful*** Podman, ensure the following:
+
+   ```shell
+   # The socket is running
+   systemctl start podman.socket
+   # Set the container host environment variable
+   export CONTAINER_HOST="unix:///var/run/podman/podman.sock"
+   ```
+
+### Option 3: Complete Installation
+
+To install support for both Docker and Podman:
+
+> [!NOTE]
+> If using Podman, follow the [Podman Configuration Notes](#important-podman-configuration-notes) above after installing the requirements.
 
 ```shell
-$ export CONTAINER_HOST="unix:///var/run/podman/podman.sock"
-```
-
-### Install all Python Prerequisites
-
-```shell
-$ pip3 install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 ## Usage
@@ -79,16 +105,19 @@ required arguments:
                         Scan report retry count
 ```
 
-Note that CrowdStrike Falcon OAuth2 credentials may be supplied also by the means of environment variables: FALCON_CLIENT_ID, FALCON_CLIENT_SECRET, and FALCON_CLOUD_REGION. Establishing and retrieving OAuth2 API credentials can be performed at https://falcon.crowdstrike.com/support/api-clients-and-keys.
-
-FALCON_CLIENT_ID and FALCON_CLIENT_SECRET can be set via environment variables for automation.
+> [!NOTE]
+> CrowdStrike Falcon API credentials may be supplied also by the means of environment variables:
+>
+> `FALCON_CLIENT_ID`, `FALCON_CLIENT_SECRET`, and `FALCON_CLOUD_REGION`.
+>
+> Establishing and retrieving API credentials can be performed at <https://falcon.crowdstrike.com/support/api-clients-and-keys>.
 
 ## Example Scans
 
-### Example 1:
+### Example 1
 
 ```shell
-$ python cs_scanimage.py --clientid FALCON_CLIENT_ID --repo <repo> --tag <tag> --cloud-region <cloud_region>
+python cs_scanimage.py --clientid FALCON_CLIENT_ID --repo <repo> --tag <tag> --cloud-region <cloud_region>
 
 please enter password to login
 Password:
@@ -106,7 +135,7 @@ WARNING Alert: Misconfiguration found
 INFO    Vulnerability score threshold not met: '0' out of '500'
 ```
 
-### Example 2:
+### Example 2
 
 The script provided was built to score vulnerabilities on a scale show below.
 
@@ -122,7 +151,7 @@ The default value to return a non-zero error code for vulnerabilties is one high
 The example below will accomodate vulnerabilities with a sum of 1500.
 
 ```shell
-$ python cs_scanimage.py --clientid FALCON_CLIENT_ID --repo <repo> --tag <tag> \
+python cs_scanimage.py --clientid FALCON_CLIENT_ID --repo <repo> --tag <tag> \
     --cloud-region <cloud_region> -s 1500
 
 ```

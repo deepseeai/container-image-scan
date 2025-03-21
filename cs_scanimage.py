@@ -42,7 +42,6 @@ import logging
 import sys
 from os import environ as env
 from enum import Enum
-import subprocess  # nosec
 import time
 import getpass
 from falconpy import FalconContainer, ContainerBaseURL
@@ -52,19 +51,24 @@ from retry import retry
 logging.basicConfig(stream=sys.stdout, format="%(levelname)-8s%(message)s")
 log = logging.getLogger("cs_scanimage")
 
-VERSION = "2.3.0"
+VERSION = "2.4.1"
 
 
 class ScanImage(Exception):
     """Scanning Image Tasks"""
 
-    def __init__(self, client_id, client_secret, repo, tag, client, cloud):
+    # pylint:disable=too-many-instance-attributes
+    def __init__(
+        self, client_id, client_secret, repo, tag, client, runtime, cloud
+    ):  # pylint:disable=too-many-positional-arguments
         self.client_id = client_id
         self.client_secret = client_secret
         self.repo = repo
         self.tag = tag
         self.client = client
+        self.runtime = runtime
         self.server_domain = ContainerBaseURL[cloud.replace("-", "").upper()].value
+        self.auth_config = None
 
     # Step 1: perform container tag to the registry corresponding to the cloud entered
     def container_tag(self):
@@ -88,31 +92,31 @@ class ScanImage(Exception):
     # Step 2: login using the credentials supplied
     def container_login(self):
         log.info("Performing login to CrowdStrike Image Assessment Service")
-        login = self.client.login(
-            username=self.client_id,
-            password=self.client_secret,
-            registry=self.server_domain,
-            reauth=True,
-        )
-        try:
-            log.info(login["Status"])
-        except TypeError:
-            command = ["/usr/bin/podman", "login"]
-            command.extend(["--username", self.client_id])
-            command.extend(["--password", self.client_secret])
-            command.append(self.server_domain)
-            result = subprocess.run(
-                command,
-                shell=False,
-                encoding="utf-8",  # nosec
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip()) from None
-
-            log.info(result.stdout.strip())
+        if self.runtime == "docker":
+            try:
+                login = self.client.login(
+                    username=self.client_id,
+                    password=self.client_secret,
+                    registry=self.server_domain,
+                    reauth=True,
+                )
+                log.info(login["Status"])
+            except Exception as e:
+                log.error("Docker login failed: %s", str(e))
+                raise
+        else:  # podman
+            try:
+                auth_config = {
+                    "username": self.client_id,
+                    "password": self.client_secret,
+                }
+                response = self.client.login(registry=self.server_domain, **auth_config)
+                # Store auth config for subsequent operations
+                self.auth_config = auth_config
+                log.info(response["Status"])
+            except Exception as e:
+                log.error("Podman login failed: %s", str(e))
+                raise
 
     # Step 3: perform container push using the repo and tag supplied
     @retry(TimeoutError, tries=5, delay=5)
@@ -121,29 +125,44 @@ class ScanImage(Exception):
         log.info("Performing container push to %s", image_str)
 
         try:
-            image_push = self.client.images.push(image_str, stream=True, decode=True)
-        except AttributeError:
-            image_push = self.client.push(image_str, stream=True, decode=True)
-
-        for line in image_push:
-            if "error" in line:
-                raise APIError("docker_push " + line["error"])
-
-            if "status" in line and line["status"] == "Pushing":
-                print(
-                    "Pushing {}".format(
-                        [line.get(key) for key in ["progress", "progressDetails"]]
-                    ),
-                    end="\r",
+            if self.runtime == "docker":
+                image_push = self.client.images.push(
+                    image_str, stream=True, decode=True
                 )
-            elif "status" in line:
-                log.info("Docker: %s", line["status"])
-            else:
-                log.debug(line)
+            else:  # podman
+                image_push = self.client.images.push(
+                    image_str,
+                    stream=True,
+                    auth_config=getattr(self, "auth_config", None),
+                )
+
+            for line in image_push:
+                if isinstance(line, str):
+                    line = json.loads(line)
+
+                if "error" in line:
+                    raise APIError("container_push " + line["error"])
+
+                if "status" in line and line["status"] == "Pushing":
+                    print(
+                        "Pushing {}".format(
+                            [line.get(key) for key in ["progress", "progressDetails"]]
+                        ),
+                        end="\r",
+                    )
+                elif "status" in line:
+                    log.info("%s: %s", self.runtime.capitalize(), line["status"])
+                else:
+                    log.debug(line)
+        except Exception as e:
+            log.error("Push failed: %s", str(e))
+            raise
 
 
 # Step 4: poll and get scanreport for specified amount of retries
-def get_scanreport(client_id, client_secret, cloud, user_agent, repo, tag, retry_count):
+def get_scanreport(
+    client_id, client_secret, cloud, user_agent, repo, tag, retry_count
+):  # pylint:disable=too-many-positional-arguments
     log.info("Downloading Image Scan Report")
     falcon = FalconContainer(
         client_id=client_id,
@@ -464,7 +483,51 @@ def parse_args():
     )
 
 
-def main():  # pylint: disable=R0915
+def detect_container_runtime(timeout=60):
+    """Detect whether Docker or Podman is available and return the appropriate client"""
+    try:
+        import docker  # pylint:disable=C0415
+
+        try:
+            client = docker.from_env(timeout=timeout)
+            client.ping()
+            return client, "docker"
+        except (docker.errors.APIError, docker.errors.DockerException):
+            import podman  # pylint:disable=C0415
+
+            client = podman.from_env(timeout=timeout)
+            try:
+                client.ping()
+            except (ConnectionRefusedError, podman.errors.exceptions.APIError) as exc:
+                raise RuntimeError(
+                    "Could not connect to Podman socket. "
+                    "If running rootless, ensure your podman.socket is running (systemctl --user start podman.socket). "
+                    "If running as root, ensure the CONTAINER_HOST environment variable is set correctly "
+                    "(e.g. unix:///var/run/podman/podman.sock)."
+                ) from exc
+            return client, "podman"
+    except ImportError:
+        try:
+            import podman  # pylint:disable=C0415
+
+            client = podman.from_env()
+            try:
+                client.ping()
+            except (ConnectionRefusedError, podman.errors.exceptions.APIError) as exc:
+                raise RuntimeError(
+                    "Could not connect to Podman socket. "
+                    "If running rootless, ensure your podman.socket is running (systemctl --user start podman.socket). "
+                    "If running as root, ensure the CONTAINER_HOST environment variable is set correctly "
+                    "(e.g. unix:///var/run/podman/podman.sock)."
+                ) from exc
+            return client, "podman"
+        except ImportError as exc:
+            raise RuntimeError(
+                "Neither Docker nor Podman client libraries are available"
+            ) from exc
+
+
+def main():  # pylint:disable=R0915
 
     try:
         (
@@ -485,15 +548,14 @@ def main():  # pylint: disable=R0915
             print("Please enter your Falcon OAuth2 API Secret")
             client_secret = getpass.getpass()
 
+        client, runtime = detect_container_runtime(timeout=docker_timeout)
+        log.info("Using %s container runtime", runtime)
+
         if not skip_push:
-            # Those skipping push may not have docker/podman installed
-            try:
-                import docker  # pylint: disable=C0415
-            except ModuleNotFoundError:
-                import podman as docker  # pylint: disable=C0415
-            client = docker.from_env(timeout=docker_timeout)
             useragent = "%s/%s" % (useragent, VERSION)
-            scan_image = ScanImage(client_id, client_secret, repo, tag, client, cloud)
+            scan_image = ScanImage(
+                client_id, client_secret, repo, tag, client, runtime, cloud
+            )
             scan_image.container_tag()
             scan_image.container_login()
             scan_image.container_push()
